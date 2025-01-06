@@ -1,0 +1,96 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"github.com/XXXXD-cation/agent/collector/process"
+	"github.com/mitchellh/mapstructure"
+	"hash/fnv"
+	"math/rand"
+	"runtime"
+	"time"
+
+	"github.com/XXXXD-cation/agent/collector/engine"
+	plugins "github.com/XXXXD-cation/agent/collector/plugins"
+	"github.com/XXXXD-cation/agent/collector/plugins/log"
+	"github.com/go-logr/zapr"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+)
+
+func init() {
+	runtime.GOMAXPROCS(8)
+	rand.Seed(time.Now().UnixNano())
+}
+
+func main() {
+	c := plugins.New()
+	l := log.New(
+		log.Config{
+			MaxSize:     1,
+			Path:        "collector.log",
+			FileLevel:   zapcore.InfoLevel,
+			RemoteLevel: zapcore.ErrorLevel,
+			MaxBackups:  10,
+			Compress:    true,
+			Client:      c,
+		},
+	)
+	defer l.Sync()
+	zap.ReplaceGlobals(l)
+	e := engine.New(c, zapr.NewLogger(l))
+
+	// Introduce an infinite loop for continuous monitoring
+	for {
+		procs, err := process.Processes(false)
+		if err != nil {
+			zap.S().Error(err)
+		} else {
+			for _, p := range procs {
+				cmdline, err := p.Cmdline()
+				if err != nil {
+					continue
+				}
+				stat, err := p.Stat()
+				if err != nil {
+					continue
+				}
+				status, err := p.Status()
+				if err != nil {
+					continue
+				}
+				ns, _ := p.Namespaces()
+				rec := &plugins.Record{
+					DataType:  int32(5050),
+					Timestamp: time.Now().Unix(),
+					Data: &plugins.Payload{
+						Fields: make(map[string]string, 40),
+					},
+				}
+				rec.Data.Fields["cmdline"] = cmdline
+				rec.Data.Fields["cwd"], _ = p.Cwd()
+				rec.Data.Fields["checksum"], _ = p.ExeChecksum()
+				rec.Data.Fields["exe_hash"], _ = p.ExeHash()
+				rec.Data.Fields["exe"], _ = p.Exe()
+				rec.Data.Fields["pid"] = p.Pid()
+				mapstructure.Decode(stat, &rec.Data.Fields)
+				mapstructure.Decode(status, &rec.Data.Fields)
+				mapstructure.Decode(ns, &rec.Data.Fields)
+				m, _ := e.Cache.Get(5056, ns.Pid)
+				rec.Data.Fields["container_id"] = m["container_id"]
+				rec.Data.Fields["container_name"] = m["container_name"]
+				rec.Data.Fields["integrity"] = "true"
+				// only for host files
+				if _, ok := e.Cache.Get(5057, rec.Data.Fields["exe"]); ok && rec.Data.Fields["container_id"] == "" {
+					rec.Data.Fields["integrity"] = "false"
+				}
+				f := fnv.New32()
+				seq := hex.EncodeToString(f.Sum(nil))
+				rec.Data.Fields["package_seq"] = seq
+				fmt.Println(rec)
+			}
+		}
+		// Introduce a delay between iterations to avoid excessive CPU usage
+		time.Sleep(process.TraversalInterval)
+	}
+}
